@@ -3,43 +3,94 @@ var app = null;
 Ext.define('CustomApp', {
     extend: 'Rally.app.App',
     componentCls: 'app',
-    items : [ { itemId : "exportLink", margin : "5 20 0 20"}
+    items : [ 
+        { 
+            layout:'column',
+            items : [
+                {
+                    margin : "5 20 5 20",
+                    width : 400,
+                    id:'cboFilter',
+                    xtype:'combobox',
+                    fieldLabel:'Successor',
+                    displayField:'name',
+                    valueField:'id',
+                    queryMode:'local',
+                    listeners : {
+                        scope : this,
+                        select : function(combo,records,eOpts) {
+                            app.filterSuccessor(combo,records,eOpts);
+                        }
+                    }
+                },
+                { itemId : "exportLink", margin : "5 20 5 20"}
+            ]
+        }
     ],
 
     launch: function() {
         app = this;
-        app.project = app.getContext().getProject();
-        console.log("project",app.project);
+        app.filterItems = [];
+        app.filterStore = Ext.create('Ext.data.Store',{
+            // remoteSort : true,
+            sorters: [{
+                property: 'name',
+                direction: 'ASC'
+            }],
+            fields:['id',{name:'name',type:'string'}],
+            data: app.filterItems
+        });
+        app.down("#cboFilter").bindStore(app.filterStore);
 
+        
+        app.project = app.getContext().getProject();
+        // console.log("project",app.project);
+
+        app.showFilter = app.getSetting('showFilter') === true;
         app.hideAccepted = app.getSetting('hideAccepted') === true;
         app.truncateNameTo = app.getSetting('truncateNameTo') > 0 ? parseInt(app.getSetting('truncateNameTo')) : 0;
         
-        console.log("hideAccepted",app.hideAccepted);
+        if (!app.showFilter) {
+            app.down("#cboFilter").hide();
+        }
+
+        // console.log("hideAccepted",app.hideAccepted);
         app.myMask = new Ext.LoadMask(Ext.getBody(), {msg:"Please wait..."});
         app.myMask.show();
 
         async.waterfall([ 
                           this.getDependencySnapshots,
                           this.findMissingSnapshots,
+                          this.addChildStoryInformation,
                           this.getProjectInformation,
                           this.cleanUpSnapshots,
                           this.getIterationInformation,
                           this._createGraph,
+                          this._setFilterNodes,
                           this._createNodeList,
                           this._createNodeStatus,
                           this._createDagreGraph,
                           this._createGraphViz
                           ], 
-            function(err,results){
+            function(err,nodes,links){
+                if (err !== undefined && err !== null) {
+                    app.myMask.hide();
+                    console.log("err",err);
+                    Rally.ui.notify.Notifier.show({message: err});
+                    app.add(err);
+                }
+                
                 app.myMask.hide();
-                console.log("results",results); 
+                app.nodes = nodes;
+                app.links = links;
             }
         );
     },
 
     config: {
         defaultSettings: {
-            hideAccepted   : true,
+            showFilter     : true,
+            hideAccepted   : false,
             showExportLink : true,
             truncateNameTo : "0"
         }
@@ -47,6 +98,12 @@ Ext.define('CustomApp', {
 
     getSettingsFields: function() {
         return [
+            {
+                name: 'showFilter',
+                xtype: 'rallycheckboxfield',
+                label : "Show Successor Filter"
+            },
+
             {
                 name: 'hideAccepted',
                 xtype: 'rallycheckboxfield',
@@ -70,19 +127,13 @@ Ext.define('CustomApp', {
         var projects = _.compact(_.uniq(_.map( snapshots, function(s) { return s.get("Project"); })));
         async.map( projects, app.readProject, function(err,results) {
             app.projects = _.compact(_.map(results,function(r) { return r[0];}));
-            console.log("projects", app.projects);
-            console.log("closed projects:", 
-                _.filter(app.projects,function(p){
-                    return p.get("State")==="Closed";
-                })
-            );
             callback(null,snapshots);
         });
     },
 
     cleanUpSnapshots : function( snapshots, callback) {
 
-        console.log("unfiltered snapshots:",snapshots.length);
+        // console.log("unfiltered snapshots:",snapshots.length);
         var snaps = _.filter(snapshots,function(snapshot) {
             // make sure the project for the snapshot exists
             var project = _.find(app.projects, function(p) { 
@@ -91,32 +142,55 @@ Ext.define('CustomApp', {
 
             return !(_.isUndefined(project)||_.isNull(project));
         });
-        console.log("filtered snapshots:",snaps.length);
+        // console.log("filtered snapshots:",snaps.length);
 
         callback(null,snaps);
 
     },
 
+    createIterationFilter : function(iterationIds) {
+
+        var filter = null;
+
+        _.each( iterationIds, function( iterationId, i ) {
+            var f = Ext.create('Rally.data.wsapi.Filter', {
+                    property : 'ObjectID', operator : '=', value : iterationId }
+            );
+            filter = (i===0) ? f : filter.or(f);
+        });
+        // console.log("Iteration Filter:",filter.toString());
+        return filter;
+    },
+
     getIterationInformation : function( snapshots, callback) {
 
-        var iterations = _.uniq(_.map( snapshots, function(s) { return s.get("Iteration"); }));
+        // also check for epic iterations
+        var epicIterations = _.uniq( _.flatten(_.map(snapshots, function(s) {
+            return _.map(s.get("LeafNodes"),function(leaf) { 
+                return(leaf.get("Iteration"));
+            })
+        })));
 
-        console.log("iterations",iterations);
+        var iterations = _.map( snapshots, function(s) { return s.get("Iteration"); });
+        iterations = _.union(iterations,epicIterations);
+        var iterationChunks = app.chunkArray(iterations);
+        console.log("Iteration Chunks:",iterations.length,iterationChunks.length);
 
-        var readIteration = function( iid, callback) {
-
+        var readIteration = function( iids, callback) {
             var config = { 
                 model : "Iteration", 
                 fetch : ['Name','ObjectID','StartDate','EndDate'], 
-                filters : [{property : "ObjectID", operator : "=", value : iid}],
+                // filters : app.createIterationFilter(iids),
                 context : { project : null}
             };
             app.wsapiQuery(config,callback);
         };
 
-        async.map( iterations, readIteration, function(err,results) {
-            app.iterations = _.map(results,function(r) { return r[0];});
-            app.iterations = _.reject(app.iterations,function(i) {return (i==="")||_.isUndefined(i);});
+        async.map( iterationChunks, readIteration, function(err,results) {
+            console.log("iteration results",results);
+            app.iterations = _.flatten(results);
+            // app.iterations = _.flatten( _.map(results,function(r) { return r[0]; }) );
+            // app.iterations = _.reject(app.iterations,function(i) { return (i==="") || _.isUndefined(i);});
             console.log("iterations", app.iterations);
             callback(null,snapshots);
         });
@@ -171,26 +245,44 @@ Ext.define('CustomApp', {
         });
         return _.uniq(_.flatten(missing));
     },
+
+    chunkArray : function( arr ) {
+        var oidsArrays = [];
+        var i,j,chunk = 50;
+        for (i=0, j=arr.length; i<j; i+=chunk) {          
+            oidsArrays.push(arr.slice(i,i+chunk));
+        }
+        // console.log("oidsArrays",oidsArrays);
+        return oidsArrays;
+
+    },
     
     findMissingSnapshots : function( snapshots, callback ) {
 
         var missing = app.getMissingSnapshots(snapshots);
-        console.log("missing:",missing);
+        console.log("missing:",missing,missing.length);
 
-        var config = {};
-        config.fetch = ['ObjectID','_UnformattedID', '_TypeHierarchy', 'Predecessors','Successors','Blocked','ScheduleState','Name','Project','Iteration','FormattedID'];
-        config.hydrate =  ['_TypeHierarchy','ScheduleState'];
-        config.find = {
-            'ObjectID' : { "$in" : missing },
-            '__At' : 'current',
-            'Project' : { "$exists" : true},
-            'Project' : { "$ne" : null}
-        };
+        var oidsArrays = app.chunkArray(missing);
 
-        async.map([config],app._snapshotQuery,function(err,results) {
-            console.log("missing snapshots:",results[0]);
-            _.each(results[0],function(s) {
-                snapshots.push(s);
+        var configs = _.map( oidsArrays, function(oArray) {
+            return {
+                fetch : ['ObjectID','_UnformattedID', '_TypeHierarchy', 'Predecessors','Successors','Blocked','ScheduleState','Name','Project','Iteration','FormattedID','Children'],
+                hydrate :  ['_TypeHierarchy','ScheduleState'],
+                find : {
+                    'ObjectID' : { "$in" : oArray },
+                    '__At' : 'current',
+                    'Project' : { "$exists" : true},
+                    'Project' : { "$ne" : null}
+                }
+            }
+        });
+
+        async.map(configs,app._snapshotQuery,function(err,results) {
+
+            _.each(results,function(result) {
+                _.each(result,function(s) {
+                    snapshots.push(s);
+                });
             });
             // callback(null,snapshots);
             if (app.getMissingSnapshots(snapshots).length>0)
@@ -200,13 +292,59 @@ Ext.define('CustomApp', {
         });
 
     },
+
+    // if a snapshot represents a parent story this will add key information, specifically the 
+    // iteration date of the last child.
+    addChildStoryInformation : function( snapshots, callback ) {
+
+        var epicSnapshots = _.filter(snapshots,function(s) {
+            return s.get("Children").length > 0
+        });
+
+        // console.log("epics",epicSnapshots);
+
+        async.map( epicSnapshots, app.leafNodeSnapshots,function(err,results) {
+
+            // console.log("epic results:",results);
+            _.each( results, function( leafNodes,i) {
+                epicSnapshots[i].set("LeafNodes",leafNodes);
+            });
+
+            callback(null,snapshots);
+
+        });
+
+        
+
+    },
+
+    leafNodeSnapshots : function( epicSnapshot, callback ) {
+
+        var config = {};
+
+        config.fetch = ['ObjectID','_UnformattedID', '_TypeHierarchy', 'Predecessors','Successors','Blocked','ScheduleState','Name','Project','Iteration','FormattedID','Children'];
+        config.hydrate =  ['_TypeHierarchy','ScheduleState'];
+        config.find = {         
+            '_TypeHierarchy' : { "$in" : ["HierarchicalRequirement"]},
+            '_ItemHierarchy' : { "$in" : [epicSnapshot.get("ObjectID")]},
+            // '_ProjectHierarchy' : { "$in": [app.getContext().getProject().ObjectID]}, 
+            'Children' : null,
+            '__At' : 'current',
+        };
+
+        async.map([config],app._snapshotQuery,function(error,results) {
+            callback(null,results[0]);
+        });
+        
+    },
+
     
     getDependencySnapshots : function( callback ) {
 
         var that = this;
         var config = {};
 
-        config.fetch = ['ObjectID','_UnformattedID', '_TypeHierarchy', 'Predecessors','Successors','Blocked','ScheduleState','Name','Project','Iteration','FormattedID'];
+        config.fetch = ['ObjectID','_UnformattedID', '_TypeHierarchy', 'Predecessors','Successors','Blocked','ScheduleState','Name','Project','Iteration','FormattedID','Children'];
         config.hydrate =  ['_TypeHierarchy','ScheduleState'];
         config.find = {
             '_TypeHierarchy' : { "$in" : ["HierarchicalRequirement"]} ,
@@ -223,7 +361,11 @@ Ext.define('CustomApp', {
             config.find['ScheduleState'] = { "$ne" : "Accepted" };
 
         async.map([config],app._snapshotQuery,function(error,results) {
-            callback(null,results[0]);
+            // console.log("snapshots:",results[0]);
+            if (results[0].length>0)
+                callback(null,results[0]);
+            else
+                callback("No Stories with dependencies in selected project scope",null);
         });
         
         
@@ -241,7 +383,6 @@ Ext.define('CustomApp', {
             listeners : {
                 scope : this,
                 load  : function(store,snapshots,success) {
-                    console.log("snapshots:",snapshots.length);
                     callback(null,snapshots);
                 }
             }
@@ -279,16 +420,20 @@ Ext.define('CustomApp', {
             "other-project" : "";
 
         var date_class = "";
-        var iterationEndDate = app._iterationEndDate(node.snapshot.get("Iteration"));
+        // var iterationEndDate = app._iterationEndDate(node.snapshot.get("Iteration"));
+        var iterationEndDate = app._iterationEndDate(app._getSnapshotIteration(node.snapshot));
         iterationEndDate = iterationEndDate ? moment(iterationEndDate).format("MM/DD/YYYY") : "";
         if (iterationEndDate) {
             if (node.status.length > 0)
                 date_class = node.status[0].status;
         }
+        // console.log("date:",iterationEndDate);
+
+        var childCount = node.snapshot.get('Children').length > 0 ? " (" + node.snapshot.get('Children').length + ")" : "";
 
         var tpl = Ext.create('Ext.Template', 
         "<table class='graph-node'>" +
-            "<tr><td><a class='{id_style}' href='{id_ref}' target='_blank'>{id}</a> : {name}<span class='{state_class}'> [{state}] </span></td></tr>" +
+            "<tr><td><div style='width: 16em;'><a class='{id_style}' href='{id_ref}' target='_blank'>{id}</a> : {name}<span class='{state_class}'> [{state}] </span><span>{child_count}</span></div></td></tr>" +
             "<tr><td>Project:<span class='{project_class}'>{project}</span></td></tr>" +
             "<tr><td><span class='{date_class}'>{date}</span></td></tr>" +
         "</tr></table>", { compiled : true } );
@@ -303,74 +448,11 @@ Ext.define('CustomApp', {
             project_class : project_class,
             project : projectName,
             date_class : date_class,
-            date : iterationEndDate
+            date : iterationEndDate,
+            child_count : childCount
         });
 
-
     },
-
-    // _renderNodeLabel : function( node ) {
-
-    //     console.log("Node",node.snapshot);
-
-    //     var name = app.truncateNameTo > 0 ? node.snapshot.get("Name").substring(0,app.truncateNameTo) : node.snapshot.get("Name");
-    //     console.log("name:",name);
-    //     // get the project name
-    //     var project = _.find(app.projects, function(p) { 
-    //         return node.snapshot.get("Project") === p.get("ObjectID");
-    //     });
-
-    //     if (_.isUndefined(project)||_.isNull(project)) {
-    //         console.log("problem with project for:",node);
-    //     }
-
-    //     var iterationEndDate = app._iterationEndDate(node.snapshot.get("Iteration"));
-    //     var date_span="";
-    //     var date_style = null;
-    //     if (iterationEndDate) {
-    //         if (node.status.length > 0)
-    //             date_style = node.status[0].status;
-    //     }
-
-    //     date_span= "<span class='"+date_style+"'>" + (iterationEndDate ? moment(iterationEndDate).format("MM/DD/YYYY") : "") +"</span>";
-
-    //     var idstyle = "";
-    //     if (node.snapshot.get("ScheduleState")==="Accepted") {
-    //         //idstyle = "color:black;background-color:00FF66"
-    //         idstyle="accepted-story";
-    //     }
-
-    //     var state_class = node.snapshot.get("Blocked") === true ? "status-blocked" : "";
-    //     var state_span = "<span class='"+state_class+"'>" + " [" + node.snapshot.get("ScheduleState").substring(0,1) + "] ";
-
-    //     var project_class = project.get("ObjectID") !== app.project.ObjectID ?
-    //         "other-project" : "";
-    //     var project_span = "Project:<span class='"+project_class+"'>" + 
-    //         ( _.isUndefined(project) || _.isNull(project) ? "Closed" : project.get("Name")) +
-    //         "</span>"; 
-
-    //     var idNameSpan = "<span class='story-name'><span class="+idstyle+">" + 
-    //                 node.snapshot.get("FormattedID") + "</span>" + ":" + name +
-    //             state_span + "</span>";
-
-    //     return "<table class='graph-node'>" + 
-    //             "<tr><td>" + //"<span class='story-name'><span class="+idstyle+">" + 
-    //             //node.snapshot.get("FormattedID") + "</span>" + ":" + node.snapshot.get("Name").substring(0,35) +
-    //             // node.snapshot.get("FormattedID") + "</span>" + ":" + node.snapshot.get("Name") +
-    //             app._anchor( app._linkFromSnapshot(node.snapshot), idNameSpan ) +
-    //             // node.snapshot.get("FormattedID") + "</span>" + ":" + name +
-    //             // state_span + "</span>" +
-    //             "</td></tr>" + 
-    //             "<tr><td>" + 
-    //             // "Project:"+ ( _.isUndefined(project) || _.isNull(project) ? "Closed" : project.get("Name") ) +
-    //             project_span +
-    //             "</td></tr>" + 
-    //             "<tr><td>" + 
-    //             date_span +
-    //             "</td></tr>" + 
-    //            "</tr></table>";
-
-    // },
     
     _createDagreGraph : function( nodes, links,callback ) {
 
@@ -378,8 +460,6 @@ Ext.define('CustomApp', {
         var g = new dagre.Digraph();
 
         _.each(nodes, function(node){
-            //g.addNode(node.id, { label : node.snapshot.get("Name")});
-            // g.addNode(node.id, { label : app._renderNodeLabel(node)});
             g.addNode(node.id, { label : app._renderNodeTemplate(node)});
         });
 
@@ -387,7 +467,11 @@ Ext.define('CustomApp', {
             g.addEdge(null, link.source.id, link.target.id, {label:""});
         });
 
-        var x = Ext.widget('container',{
+        if (!_.isUndefined(app.x) && !_.isNull(app.x)) {
+            app.x.destroy();
+        }
+
+        app.x = Ext.widget('container',{
             autoShow: true ,shadow: false,title: "",resizable: false,margin: 10
             ,html: '<div id="demo-container" class="div-container"></div>'
             ,listeners: {
@@ -396,7 +480,6 @@ Ext.define('CustomApp', {
                 afterrender : function(panel) {
                     var svg = d3.select("#demo-container").append("div").append("svg")
                     .attr("class","svg")
-                    // .append("g")
                     .attr("transform","translate(10,10)");
 
                     var renderer = new dagreD3.Renderer();
@@ -405,7 +488,7 @@ Ext.define('CustomApp', {
                 }
             }
         });
-        app.add(x);
+        app.add(app.x);
         callback(null,nodes,links);
 
     },
@@ -413,6 +496,9 @@ Ext.define('CustomApp', {
     _formatGraphVizNode : function (node) {
 
         var name = app.truncateNameTo > 0 ? node.snapshot.get("Name").substring(0,app.truncateNameTo) : node.snapshot.get("Name");
+
+        // replace & with + chars from name as they cause a problem when using the 'dot' command.
+        name = name.replace(/\&/g,"+");
 
         // example : US15036 [label=<<TABLE><TR><TD>US15036:Create C2P test cases for th<br/>e reviewed + approved claim scenari<br/>os[A]</TD></TR><TR><TD>Project:: <FONT color='blue'>CNG End-to-End Test</FONT> </TD></TR><TR><TD><FONT color='green'>(9/16/2011)</FONT></TD></TR></TABLE>>]
         var project = _.find(app.projects, function(p) { 
@@ -423,7 +509,8 @@ Ext.define('CustomApp', {
             console.log("problem with project for:",node);
         }
 
-        var iterationEndDate = app._iterationEndDate(node.snapshot.get("Iteration"));
+        // var iterationEndDate = app._iterationEndDate(node.snapshot.get("Iteration"));
+        var iterationEndDate = app._iterationEndDate(app._getSnapshotIteration(node.snapshot));
 
         var g = node.snapshot.get("FormattedID") + " ";
         g = g + " [label=<";
@@ -473,27 +560,40 @@ Ext.define('CustomApp', {
 
         gv = gv + gvLinks + " }";
 
-        console.log("========================");
-        console.log(gv);
-        console.log("========================");
-
         app.gv = gv;
 
         if (app.getSetting('showExportLink') === true) {
+
+            var autoEl = Ext.create('Ext.Component',{
+                itemId : 'autoel-export',
+                autoEl : {
+                    tag : 'a',
+                    href : 'data:text/dot;charset=utf8,' + encodeURIComponent(app.gv),
+                    download : 'export.dot',
+                    html : 'Click to download dot file'
+                }
+            });
+
+            console.log("adding export link");
             var link = app.down("#exportLink");
-            link.update(app._createLink(app.gv));
-            // app.add(link);
+            var f;
+            while(f = link.items.first()){
+                link.remove(f, true);
+            }
+            link.add(autoEl);
         }
-        
 
         callback(null,nodes,links);
 
     },
 
     _createLink : function(gvString) {
-        return "<a href='data:text/dot;charset=utf8," + encodeURIComponent(gvString) + "' download='export.dot'>Click to download dot file</a>";
+        var l = "<a href='data:text/dot;charset=utf8," + encodeURIComponent(gvString) + "' download='export.dot'>Click to download dot file</a>";
+        // var l = "<a href='data:text/dot;charset=utf8," + gvString + "' download='export.dot'>Click to download dot file</a>";
+        console.log(l);
+        console.log(l.length);
+        return l;
     },
-
 
     _createGraph : function( snapshots, callback ) {
         var that = this;
@@ -515,12 +615,40 @@ Ext.define('CustomApp', {
                 var target = _.find(nodes,function(node) { return node.id == pred;});
                 // may be undefined if pred is out of project scope, need to figure out how to deal with that
                 if (!_.isUndefined(target)) {
+                    // var dupFound = _.find(links,function(link){
+                    //     return link.source.id === node.id && link.target.id === target.id;
+                    // });
+                    // console.log("dup:",dupFound,node.id,target.id);
+
                     links.push({ source : node, target : target  });
                 } else {
                     console.log("unable to find pred:",pred);
                 }
             });
         });
+        callback(null,nodes,links);
+
+    },
+
+    _setFilterNodes : function(nodes,links,callback) {
+
+        _.each(links,function(link) {
+            // is this link source the target of another link ? 
+            var targets = _.filter(links,function(targetLink) {
+                return link.source.id === targetLink.target.id;
+            });
+            // if not then we add it to the filter list.
+            if (targets.length===0) {
+                app.filterItems.push( { id: link.source.id, name: link.source.snapshot.get("FormattedID") + ": "+link.source.snapshot.get("Name") });
+            }
+        });
+
+        app.filterItems = _.uniq(app.filterItems,"name");
+        // app.filterItems = _.sortBy(app.filterItems,"name");
+        // console.log("filter store",app.filterItems);
+        app.filterStore.sort();
+        app.filterStore.reload();
+
         callback(null,nodes,links);
 
     },
@@ -539,17 +667,12 @@ Ext.define('CustomApp', {
     },
 
     _createNodeList : function( nodes, links, callback ) {
-
         _.each(nodes, function(node) {
-            // console.log("node:",node.id);
             var list = [];
             app._createLinkListForNode( node, list, nodes, links );
-            // console.log("List:",_.map(list,function(l){return l.id;}));
             node.list = list;
         });
-
         callback(null,nodes, links);
-
     },
 
     // the status for the node is based on its downstream dependencies in the list
@@ -557,11 +680,13 @@ Ext.define('CustomApp', {
 
         _.each(nodes, function(node) {
             _.each( node.list, function(listNode,i) {
-                node.status = [];
+                if (!node.status) node.status = [];
+                
                 if (i > 0) {
                     var status = app._createStatusForNodes( node, listNode );
                     if ( status !== "status-good" )
                         node.status.push({ status : status, target : listNode });
+                    console.log("node status:",node);
                 }
             });
         });
@@ -569,6 +694,7 @@ Ext.define('CustomApp', {
     },
 
     _getIteration : function(iid) {
+
 
         var iteration = _.find( app.iterations,
             function(it){
@@ -582,14 +708,36 @@ Ext.define('CustomApp', {
 
     _iterationEndDate : function(iid) {
         var iteration = app._getIteration(iid);
-        return iteration ? iteration.raw.EndDate : null;
+        return iteration ? 
+                    Rally.util.DateTime.fromIsoString(iteration.raw.EndDate) 
+                    : null;
+    },
+
+    // used to get the iteration on the snapshot. if an epic snapshot it will be last iteration
+    // of the leafnodes.
+    _getSnapshotIteration : function(snapshot) {
+        var leafNodes = snapshot.get("LeafNodes");
+
+        // if child snapshot then just return the iteration
+        if (_.isUndefined(leafNodes)||_.isNull(leafNodes)||leafNodes.length===0) {
+            return snapshot.get("Iteration");
+        }
+        // otherwise return the last of the leaf nodes based on iteration end date. 
+        var max = _.max(leafNodes, function(leaf) {
+            var i = leaf.get("Iteration");
+            return app._iterationEndDate(i);
+        });
+        // console.log("max",max);
+        return max.get("Iteration");
     },
 
     _createStatusForNodes : function( src, tgt ) {
 
         // is scheduled ? 
-        var srcIteration = src.snapshot.get("Iteration");
-        var tgtIteration = tgt.snapshot.get("Iteration");
+        // var srcIteration = src.snapshot.get("Iteration");
+        var srcIteration = app._getSnapshotIteration(src.snapshot);
+        // var tgtIteration = tgt.snapshot.get("Iteration");
+        var tgtIteration = app._getSnapshotIteration(tgt.snapshot);
         if ( _.isUndefined(tgtIteration) || _.isNull(tgtIteration) || tgtIteration === "" )
             // return "yellow";
             return "status-not-scheduled";
@@ -602,7 +750,40 @@ Ext.define('CustomApp', {
 
         return "status-good";
 
+    },
+
+
+    filterSuccessor : function(combo,records,eOpts) {      
+        
+        var selected = records[0];
+        var root = _.find(app.nodes,function(node) { return node.id === selected.get("id");});
+
+        var newNodes = [];
+        var newLinks = [];
+
+        var walkTheLine = function(root, newNodes, newLinks) {
+            if (_.find(newNodes,function(n){return n.id===root.id;})===undefined)
+                newNodes.push(root);
+            var links = _.filter(app.links,function(link) { return link.source.id === root.id;});
+            _.each(links,function(link){ 
+                newLinks.push(link);
+                walkTheLine(link.target,newNodes,newLinks);
+            });
+        }
+
+        walkTheLine( root, newNodes, newLinks);
+
+        app._createDagreGraph(newNodes,newLinks,function(err,nodes,links) {
+
+            console.log("filtering graph viz");
+            app._createGraphViz(newNodes,newLinks,function(err,n,l) {
+
+            });
+            
+        })
     }
+
+
 
    
 });
